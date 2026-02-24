@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import axios from "axios";
 import {
   Upload,
@@ -16,13 +16,31 @@ const API = "/api";
 
 export default function App() {
   const [documents, setDocuments] = useState([]);
-  const [messages, setMessages] = useState([]);
+  const [messages, setMessages] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("rag_messages") || "[]");
+    } catch {
+      return [];
+    }
+  });
   const [question, setQuestion] = useState("");
   const [uploading, setUploading] = useState(false);
   const [querying, setQuerying] = useState(false);
   const [uploadStatus, setUploadStatus] = useState(null);
   const fileInputRef = useRef(null);
   const chatEndRef = useRef(null);
+
+  useEffect(() => {
+    axios.get(`${API}/documents`).then((res) => {
+      if (res.data.documents?.length) {
+        setDocuments(res.data.documents.map((name) => ({ name, chunks: null })));
+      }
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("rag_messages", JSON.stringify(messages));
+  }, [messages]);
 
   const scrollToBottom = () => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -93,6 +111,7 @@ export default function App() {
       setDocuments([]);
       setMessages([]);
       setUploadStatus(null);
+      localStorage.removeItem("rag_messages");
     } catch {
       setUploadStatus({ type: "error", message: "Failed to clear documents." });
     }

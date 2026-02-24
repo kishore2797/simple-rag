@@ -12,6 +12,8 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from langchain.retrievers import MultiQueryRetriever
+from langchain.schema import Document
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 LLM_MODEL = "llama3.2"
@@ -43,13 +45,18 @@ vectorstore = Chroma(
 )
 
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200,
+    chunk_size=700,
+    chunk_overlap=150,
 )
 
-PROMPT_TEMPLATE = """Use the following context to answer the question at the end.
-If you don't know the answer from the context, say "I don't have enough information to answer that."
-Do not make up information.
+PROMPT_TEMPLATE = """You are an assistant that answers questions strictly based on the provided context.
+
+Rules:
+- Use ONLY the context below to answer. Do not use outside knowledge.
+- Chunks marked [FRONT MATTER] contain the book's own title page, copyright page, and publication info. These are the authoritative source for: title, editor, author, publisher, ISBN, and publication year. Always prefer [FRONT MATTER] over any citations or references found elsewhere in the text.
+- Do NOT confuse books cited or referenced within the text with the book being asked about.
+- If the answer is not found in the context, say "I don't have enough information to answer that."
+- Be specific and direct.
 
 Context:
 {context}
@@ -98,7 +105,7 @@ async def upload_document(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, f)
 
     if suffix == ".pdf":
-        loader = PyPDFLoader(str(file_path))
+        loader = PyPDFLoader(str(file_path))    
     else:
         loader = TextLoader(str(file_path), encoding="utf-8")
 
@@ -107,10 +114,21 @@ async def upload_document(file: UploadFile = File(...)):
 
     for chunk in chunks:
         chunk.metadata["source"] = file.filename
+        chunk.metadata["chunk_type"] = "body"
 
-    vectorstore.add_documents(chunks)
+    extra_chunks = []
+    if suffix == ".pdf" and documents:
+        front_pages = documents[:min(5, len(documents))]
+        front_text = "[FRONT MATTER]\n" + "\n".join(p.page_content for p in front_pages)
+        extra_chunks.append(Document(
+            page_content=front_text,
+            metadata={"source": file.filename, "chunk_type": "front_matter"},
+        ))
 
-    return DocumentInfo(name=file.filename, chunks=len(chunks))
+    all_chunks = extra_chunks + chunks
+    vectorstore.add_documents(all_chunks)
+
+    return DocumentInfo(name=file.filename, chunks=len(all_chunks))
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -122,7 +140,11 @@ async def query_documents(request: QueryRequest):
             detail="No documents uploaded yet. Please upload a document first.",
         )
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    base_retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 6, "fetch_k": 20},
+    )
+    retriever = MultiQueryRetriever.from_llm(retriever=base_retriever, llm=llm)
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
