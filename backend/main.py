@@ -1,4 +1,3 @@
-import re
 import shutil
 from pathlib import Path
 from typing import List
@@ -167,23 +166,7 @@ async def query_documents(request: QueryRequest):
 
     result = {"result": raw_answer, "source_documents": retrieved}
 
-    answer = result["result"]
-    answer = re.sub(
-        r"^[\w\s',]+(?:is not explicitly stated|is not provided|cannot be determined|is unclear)"
-        r"[\w\s',\.]*?(?:However,|But,|That said,)?\s*"
-        r"(?:according to (?:the )?\[FRONT MATTER\],?\s*|based on (?:the )?(?:provided )?context,?\s*|the (?:provided )?context (?:states?|indicates?|shows?|reveals?) that\s*)?",
-        "",
-        answer,
-        flags=re.IGNORECASE,
-    ).strip()
-    answer = re.sub(
-        r"^(?:According to|Based on)(?: the)?(?: \[FRONT MATTER\]| provided context| context),?\s*",
-        "",
-        answer,
-        flags=re.IGNORECASE,
-    ).strip()
-    if answer:
-        answer = answer[0].upper() + answer[1:]
+    answer = result["result"].strip()
 
     sources = list(
         {doc.metadata.get("source", "unknown") for doc in result["source_documents"]}
