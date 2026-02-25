@@ -38,9 +38,9 @@ export default function App() {
     }).catch(() => {});
   }, []);
 
-  useEffect(() => {
-    localStorage.setItem("rag_messages", JSON.stringify(messages));
-  }, [messages]);
+  // useEffect(() => {
+  //   localStorage.setItem("rag_messages", JSON.stringify(messages));
+  // }, [messages]);
 
   const scrollToBottom = () => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });

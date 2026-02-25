@@ -1,3 +1,4 @@
+import re
 import shutil
 from pathlib import Path
 from typing import List
@@ -10,9 +11,7 @@ from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from langchain.retrievers import MultiQueryRetriever
 from langchain.schema import Document
 
 OLLAMA_BASE_URL = "http://localhost:11434"
@@ -49,24 +48,23 @@ text_splitter = RecursiveCharacterTextSplitter(
     chunk_overlap=150,
 )
 
-PROMPT_TEMPLATE = """You are an assistant that answers questions strictly based on the provided context.
+PROMPT_TEMPLATE = """Use the context below to answer the question. Give a short, direct answer only.
 
-Rules:
-- Use ONLY the context below to answer. Do not use outside knowledge.
-- Chunks marked [FRONT MATTER] contain the book's own title page, copyright page, and publication info. These are the authoritative source for: title, editor, author, publisher, ISBN, and publication year. Always prefer [FRONT MATTER] over any citations or references found elsewhere in the text.
-- Do NOT confuse books cited or referenced within the text with the book being asked about.
-- If the answer is not found in the context, say "I don't have enough information to answer that."
-- Be specific and direct.
+Important:
+- Any section starting with [FRONT MATTER] contains the book's title page and copyright page. Use it as the definitive source for the book's title, editor, publisher, and year.
+- Do not mention other books referenced or cited inside the text.
+- Do not say "not explicitly stated" or "however". Just answer.
+- If the context truly does not contain the answer, say only: "I don't have enough information to answer that."
 
 Context:
 {context}
 
 Question: {question}
 
-Answer:"""
+Answer (one or two sentences, no preamble):"""
 
 prompt = PromptTemplate(
-    template=PROMPT_TEMPLATE,
+    template=PROMPT_TEMPLATE,   
     input_variables=["context", "question"],
 )
 
@@ -119,7 +117,18 @@ async def upload_document(file: UploadFile = File(...)):
     extra_chunks = []
     if suffix == ".pdf" and documents:
         front_pages = documents[:min(5, len(documents))]
-        front_text = "[FRONT MATTER]\n" + "\n".join(p.page_content for p in front_pages)
+        raw_front = "\n".join(p.page_content for p in front_pages)
+
+        pub_year = None
+        copyright_match = re.search(r"©.*?(\d{4})|Springer.*?(\d{4})|published.*?(\d{4})", raw_front, re.IGNORECASE)
+        if copyright_match:
+            pub_year = next(y for y in copyright_match.groups() if y)
+
+        annotation = ""
+        if pub_year:
+            annotation = f"[PUBLICATION YEAR: {pub_year}] [NOTE: Any other years on this page (e.g. Library of Congress control numbers, ISBN registration years) are NOT the publication year.]\n\n"
+
+        front_text = "[FRONT MATTER]\n" + annotation + raw_front
         extra_chunks.append(Document(
             page_content=front_text,
             metadata={"source": file.filename, "chunk_type": "front_matter"},
@@ -140,26 +149,47 @@ async def query_documents(request: QueryRequest):
             detail="No documents uploaded yet. Please upload a document first.",
         )
 
-    base_retriever = vectorstore.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": 6, "fetch_k": 20},
-    )
-    retriever = MultiQueryRetriever.from_llm(retriever=base_retriever, llm=llm)
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": prompt},
-    )
+    retrieved = vectorstore.similarity_search(request.question, k=8)
 
-    result = qa_chain.invoke({"query": request.question})
+    front_matter_docs = [
+        doc for doc, meta in zip(collection["documents"], collection["metadatas"])
+        if meta and meta.get("chunk_type") == "front_matter"
+    ]
+    seen_ids = {doc.page_content[:100] for doc in retrieved}
+    for fm_text in front_matter_docs:
+        if fm_text[:100] not in seen_ids:
+            retrieved.insert(0, Document(page_content=fm_text, metadata={"chunk_type": "front_matter"}))
+            seen_ids.add(fm_text[:100])
+
+    context = "\n\n---\n\n".join(doc.page_content for doc in retrieved)
+    filled_prompt = prompt.format(context=context, question=request.question)
+    raw_answer = llm.invoke(filled_prompt).content
+
+    result = {"result": raw_answer, "source_documents": retrieved}
+
+    answer = result["result"]
+    answer = re.sub(
+        r"^[\w\s',]+(?:is not explicitly stated|is not provided|cannot be determined|is unclear)"
+        r"[\w\s',\.]*?(?:However,|But,|That said,)?\s*"
+        r"(?:according to (?:the )?\[FRONT MATTER\],?\s*|based on (?:the )?(?:provided )?context,?\s*|the (?:provided )?context (?:states?|indicates?|shows?|reveals?) that\s*)?",
+        "",
+        answer,
+        flags=re.IGNORECASE,
+    ).strip()
+    answer = re.sub(
+        r"^(?:According to|Based on)(?: the)?(?: \[FRONT MATTER\]| provided context| context),?\s*",
+        "",
+        answer,
+        flags=re.IGNORECASE,
+    ).strip()
+    if answer:
+        answer = answer[0].upper() + answer[1:]
 
     sources = list(
         {doc.metadata.get("source", "unknown") for doc in result["source_documents"]}
     )
 
-    return QueryResponse(answer=result["result"], sources=sources)
+    return QueryResponse(answer=answer, sources=sources)
 
 
 @app.delete("/documents")
