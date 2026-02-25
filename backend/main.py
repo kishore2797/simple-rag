@@ -1,3 +1,4 @@
+import re
 import shutil
 from pathlib import Path
 from typing import List
@@ -8,10 +9,12 @@ from pydantic import BaseModel
 
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.retrievers import BM25Retriever
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
+from flashrank import Ranker, RerankRequest
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 LLM_MODEL = "llama3.2"
@@ -42,10 +45,23 @@ vectorstore = Chroma(
     collection_name="documents",
 )
 
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=700,
-    chunk_overlap=150,
+# Child splitter — small chunks for precise retrieval
+child_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=400,
+    chunk_overlap=80,
 )
+
+# Parent splitter — larger chunks sent to LLM for full context
+parent_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1200,
+    chunk_overlap=200,
+)
+
+# Reranker (runs fully locally, no API needed)
+reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir=str(BASE_DIR / "reranker_cache"))
+
+# In-memory store: child_chunk_id → parent Document
+parent_store: dict[str, Document] = {}
 
 PROMPT_TEMPLATE = """Use the context below to answer the question. Give a short, direct answer only.
 
@@ -107,12 +123,34 @@ async def upload_document(file: UploadFile = File(...)):
         loader = TextLoader(str(file_path), encoding="utf-8")
 
     documents = loader.load()
-    chunks = text_splitter.split_documents(documents)
 
-    for chunk in chunks:
-        chunk.metadata["source"] = file.filename
-        chunk.metadata["chunk_type"] = "body"
+    # --- UPGRADE 3: Parent-Child Chunking ---
+    # Split into large parent chunks (1200 chars) for rich LLM context
+    parents = parent_splitter.split_documents(documents)
+    for i, p in enumerate(parents):
+        p.metadata["source"] = file.filename
+        p.metadata["chunk_type"] = "parent"
+        p.metadata["parent_id"] = f"{file.filename}::parent::{i}"
 
+    # Split into small child chunks (400 chars) for precise retrieval
+    child_chunks = []
+    for i, parent in enumerate(parents):
+        children = child_splitter.split_text(parent.page_content)
+        for j, child_text in enumerate(children):
+            child_id = f"{file.filename}::parent::{i}::child::{j}"
+            child_doc = Document(
+                page_content=child_text,
+                metadata={
+                    "source": file.filename,
+                    "chunk_type": "child",
+                    "parent_id": f"{file.filename}::parent::{i}",
+                    "child_id": child_id,
+                },
+            )
+            child_chunks.append(child_doc)
+            parent_store[child_id] = parent  # map child → parent
+
+    # --- Front Matter (metadata chunk for title/editor/year) ---
     extra_chunks = []
     if suffix == ".pdf" and documents:
         front_pages = documents[:min(5, len(documents))]
@@ -133,7 +171,7 @@ async def upload_document(file: UploadFile = File(...)):
             metadata={"source": file.filename, "chunk_type": "front_matter"},
         ))
 
-    all_chunks = extra_chunks + chunks
+    all_chunks = extra_chunks + child_chunks
     vectorstore.add_documents(all_chunks)
 
     return DocumentInfo(name=file.filename, chunks=len(all_chunks))
@@ -148,23 +186,80 @@ async def query_documents(request: QueryRequest):
             detail="No documents uploaded yet. Please upload a document first.",
         )
 
-    retrieved = vectorstore.similarity_search(request.question, k=8)
+    # --- UPGRADE 1: Hybrid Retrieval (Dense + BM25) with RRF Fusion ---
+    # Step 1a: Dense retrieval (semantic similarity)
+    dense_results = vectorstore.similarity_search(request.question, k=12)
+    dense_body = [d for d in dense_results if d.metadata.get("chunk_type") != "front_matter"]
 
+    # Step 1b: BM25 retrieval (keyword matching) over all stored body chunks
+    all_body_texts = [
+        Document(page_content=doc, metadata=meta)
+        for doc, meta in zip(collection["documents"], collection["metadatas"])
+        if meta and meta.get("chunk_type") == "child"
+    ]
+    bm25_results = []
+    if all_body_texts:
+        bm25_retriever = BM25Retriever.from_documents(all_body_texts)
+        bm25_retriever.k = 12
+        bm25_results = bm25_retriever.invoke(request.question)
+
+    # Step 1c: RRF (Reciprocal Rank Fusion) — merge dense + BM25 rankings
+    rrf_scores: dict[str, float] = {}
+    rrf_docs: dict[str, Document] = {}
+    k_rrf = 60  # standard RRF constant
+    for rank, doc in enumerate(dense_body):
+        key = doc.page_content[:120]
+        rrf_scores[key] = rrf_scores.get(key, 0) + 1 / (k_rrf + rank + 1)
+        rrf_docs[key] = doc
+    for rank, doc in enumerate(bm25_results):
+        key = doc.page_content[:120]
+        rrf_scores[key] = rrf_scores.get(key, 0) + 1 / (k_rrf + rank + 1)
+        rrf_docs[key] = doc
+
+    fused = sorted(rrf_docs.values(), key=lambda d: rrf_scores[d.page_content[:120]], reverse=True)[:12]
+
+    # --- UPGRADE 3: Replace child chunks with their parent chunks ---
+    # Child chunks matched semantically; return full parent context to LLM
+    context_docs: list[Document] = []
+    seen_parents: set[str] = set()
+    for doc in fused:
+        pid = doc.metadata.get("parent_id") or doc.metadata.get("child_id", "")
+        parent = parent_store.get(doc.metadata.get("child_id", ""))
+        if parent and pid not in seen_parents:
+            context_docs.append(parent)
+            seen_parents.add(pid)
+        elif pid not in seen_parents:
+            context_docs.append(doc)
+            seen_parents.add(pid)
+
+    # --- UPGRADE 2: Re-ranking with cross-encoder ---
+    # Cross-encoder scores each (question, chunk) pair jointly — much more accurate than cosine
+    if context_docs:
+        rerank_request = RerankRequest(
+            query=request.question,
+            passages=[{"id": i, "text": d.page_content} for i, d in enumerate(context_docs)],
+        )
+        rerank_results = reranker.rerank(rerank_request)
+        reranked_indices = [r["id"] for r in sorted(rerank_results, key=lambda x: x["score"], reverse=True)[:6]]
+        context_docs = [context_docs[i] for i in reranked_indices]
+
+    # Always inject front-matter chunk first for metadata questions
     front_matter_docs = [
-        doc for doc, meta in zip(collection["documents"], collection["metadatas"])
+        Document(page_content=doc, metadata=meta)
+        for doc, meta in zip(collection["documents"], collection["metadatas"])
         if meta and meta.get("chunk_type") == "front_matter"
     ]
-    seen_ids = {doc.page_content[:100] for doc in retrieved}
-    for fm_text in front_matter_docs:
-        if fm_text[:100] not in seen_ids:
-            retrieved.insert(0, Document(page_content=fm_text, metadata={"chunk_type": "front_matter"}))
-            seen_ids.add(fm_text[:100])
+    seen_fm = {d.page_content[:100] for d in context_docs}
+    for fm_doc in front_matter_docs:
+        if fm_doc.page_content[:100] not in seen_fm:
+            context_docs.insert(0, fm_doc)
+            seen_fm.add(fm_doc.page_content[:100])
 
-    context = "\n\n---\n\n".join(doc.page_content for doc in retrieved)
+    context = "\n\n---\n\n".join(doc.page_content for doc in context_docs)
     filled_prompt = prompt.format(context=context, question=request.question)
     raw_answer = llm.invoke(filled_prompt).content
 
-    result = {"result": raw_answer, "source_documents": retrieved}
+    result = {"result": raw_answer, "source_documents": context_docs}
 
     answer = result["result"].strip()
 
@@ -177,7 +272,8 @@ async def query_documents(request: QueryRequest):
 
 @app.delete("/documents")
 async def clear_documents():
-    global vectorstore
+    global vectorstore, parent_store
+    parent_store.clear()
     vectorstore.delete_collection()
     if UPLOAD_DIR.exists():
         shutil.rmtree(UPLOAD_DIR)
