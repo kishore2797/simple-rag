@@ -63,20 +63,22 @@ reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir=str(BASE_DIR /
 # In-memory store: child_chunk_id → parent Document
 parent_store: dict[str, Document] = {}
 
-PROMPT_TEMPLATE = """Use the context below to answer the question. Give a short, direct answer only.
+PROMPT_TEMPLATE = """You are answering questions strictly based on the provided context. Do NOT use your training knowledge.
 
-Important:
-- Any section starting with [FRONT MATTER] contains the book's title page and copyright page. Use it as the definitive source for the book's title, editor, publisher, and year.
-- Do not mention other books referenced or cited inside the text.
-- Do not say "not explicitly stated" or "however". Just answer.
-- If the context truly does not contain the answer, say only: "I don't have enough information to answer that."
+Rules:
+- Answer ONLY using the context below. If the context contains an exact quote or specific formulation, use that — do not paraphrase into a generic version.
+- Any section starting with [FRONT MATTER] is the definitive source for title, editor, publisher, and year.
+- Do not reference other books cited in the text.
+- Do not say "not explicitly stated", "however", or "I believe". Just answer directly.
+- If the context does not contain the answer, say only: "I don't have enough information to answer that."
+- When asked about a prediction or claim, quote the exact wording from the context, not a popular paraphrase.
 
 Context:
 {context}
 
 Question: {question}
 
-Answer (one or two sentences, no preamble):"""
+Answer (one or two sentences using the exact wording from context where possible):"""
 
 prompt = PromptTemplate(
     template=PROMPT_TEMPLATE,   
@@ -187,8 +189,19 @@ async def query_documents(request: QueryRequest):
         )
 
     # --- UPGRADE 1: Hybrid Retrieval (Dense + BM25) with RRF Fusion ---
-    # Step 1a: Dense retrieval (semantic similarity)
-    dense_results = vectorstore.similarity_search(request.question, k=12)
+    # Step 1a: Dense retrieval (semantic similarity) — two passes:
+    # Pass 1: literal question
+    # Pass 2: rephrase question to catch specific formulations (avoids semantic drift)
+    dense_results = vectorstore.similarity_search(request.question, k=10)
+    # Second pass with expanded phrasing to pull specific book quotes
+    rephrased = request.question + " exact quote specific formulation stated in the text"
+    dense_results2 = vectorstore.similarity_search(rephrased, k=6)
+    # Merge both passes, keeping order (pass1 first for RRF ranking)
+    seen_pass = {d.page_content[:120] for d in dense_results}
+    for d in dense_results2:
+        if d.page_content[:120] not in seen_pass:
+            dense_results.append(d)
+            seen_pass.add(d.page_content[:120])
     dense_body = [d for d in dense_results if d.metadata.get("chunk_type") != "front_matter"]
 
     # Step 1b: BM25 retrieval (keyword matching) over all stored body chunks
@@ -231,6 +244,33 @@ async def query_documents(request: QueryRequest):
         elif pid not in seen_parents:
             context_docs.append(doc)
             seen_parents.add(pid)
+
+    # --- Keyword injection: catch exact-quote chunks that semantic search misses ---
+    # Extract key nouns/terms from question (words >4 chars, ignore stopwords)
+    _stopwords = {"what", "which", "when", "where", "does", "make", "made", "have",
+                  "that", "this", "from", "with", "about", "were", "will", "would",
+                  "their", "there", "these", "those", "into", "over", "also", "some"}
+    question_keywords = [
+        w.lower() for w in re.findall(r"[a-zA-Z]+", request.question)
+        if len(w) > 4 and w.lower() not in _stopwords
+    ]
+    if question_keywords:
+        seen_context = {d.page_content[:120] for d in context_docs}
+        for doc_text, meta in zip(collection["documents"], collection["metadatas"]):
+            if not meta or meta.get("chunk_type") != "child":
+                continue
+            doc_lower = doc_text.lower()
+            # inject if at least 2 keywords appear in the chunk
+            match_count = sum(1 for kw in question_keywords if kw in doc_lower)
+            if match_count >= 2 and doc_text[:120] not in seen_context:
+                injected = Document(page_content=doc_text, metadata=meta)
+                parent = parent_store.get(meta.get("child_id", ""))
+                if parent and parent.page_content[:120] not in seen_context:
+                    context_docs.append(parent)
+                    seen_context.add(parent.page_content[:120])
+                elif doc_text[:120] not in seen_context:
+                    context_docs.append(injected)
+                    seen_context.add(doc_text[:120])
 
     # --- UPGRADE 2: Re-ranking with cross-encoder ---
     # Cross-encoder scores each (question, chunk) pair jointly — much more accurate than cosine
