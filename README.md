@@ -1,4 +1,4 @@
-# Simple RAG
+# Simple RAG to Advanced RAG
 
 A local, privacy-first Retrieval-Augmented Generation (RAG) app. Upload documents and ask questions about them — everything runs on your machine with no API keys required.
 
